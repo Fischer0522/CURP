@@ -38,6 +38,7 @@ hack/tls-setup/certs
 *.prof
 curp-*
 server
+client
 curp_server/curp_server
 curp_client/curp_client
 *.db
