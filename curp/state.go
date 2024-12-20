@@ -49,6 +49,7 @@ type StateMachine struct {
 	commandSet   map[command.ProposeId]struct{}
 	witness      witness.Witness
 	stateChangeC chan raft.StateType
+	workers      []*PartitionWorker
 }
 
 var stmap = [...]string{
@@ -56,6 +57,14 @@ var stmap = [...]string{
 	"StateCandidate",
 	"StateLeader",
 	"StatePreCandidate",
+}
+
+func (s *StateMachine) initWorkers(num int, kvStore *xkv.KVStore, raftState raft.StateType) []*PartitionWorker {
+	workers := make([]*PartitionWorker, num)
+	for i := 0; i < num; i++ {
+		workers[i] = NewPartitionWorker(i, s.proposeC, kvStore, raftState)
+	}
+	return workers
 }
 
 func newGrpcState(rpcAddr string, nodeId int, snapshotter *snap.Snapshotter, proposeC chan<- string, stateC chan raft.StateType, commitC <-chan *commit, errorC <-chan error) *StateMachine {
@@ -84,11 +93,13 @@ func newGrpcState(rpcAddr string, nodeId int, snapshotter *snap.Snapshotter, pro
 			log.Panic(err)
 		}
 	}
+	s.workers = s.initWorkers(16, &s.KVStore, s.raftState)
+
 	go Startgrpc(s, rpcAddr)
 	trace.Trace(trace.Info, nodeId, "init curp state machine")
 	// read commits from raft into kvStore map until error
 	go s.readCommits(commitC, errorC)
-	go s.cmd_worker()
+	//go s.cmd_worker()
 	go s.listenRaftState()
 	return s
 }
@@ -122,7 +133,7 @@ func newState(nodeId int, snapshotter *snap.Snapshotter, proposeC chan<- string,
 	trace.Trace(trace.Info, nodeId, "init curp state machine")
 	// read commits from raft into kvStore map until error
 	go s.readCommits(commitC, errorC)
-	go s.cmd_worker()
+	//	go s.cmd_worker()
 	go s.listenRaftState()
 	return s
 }
@@ -138,58 +149,14 @@ func (s *StateMachine) Lookup(cmd *curp_proto.CurpClientCommand) *curp_proto.Cur
 
 func (s *StateMachine) Propose(cmd *curp_proto.CurpClientCommand) *curp_proto.CurpReply {
 
-	isConflict := s.witness.InsertIfNotConflict(cmd)
-	s.mu.Lock()
-	if s.raftState == raft.StateLeader {
-		trace.Trace(trace.Leader, s.NodeId, "propose command %s,type: %s,conflict: %v", cmd.Key, command.OpFmt[cmd.Op], isConflict)
-	} else {
-		trace.Trace(trace.Follower, s.NodeId, "propose command %s,type: %s,conflict: %v", cmd.Key, command.OpFmt[cmd.Op], isConflict)
-	}
-	if s.raftState != raft.StateLeader {
-		if isConflict {
-			// TODO: return and report conflict
-			s.mu.Unlock()
-			reply := &curp_proto.CurpReply{
-				Content:    "",
-				StatusCode: curp_proto.CONFLICT,
-			}
-			return reply
-		} else {
-			s.mu.Unlock()
-			reply := &curp_proto.CurpReply{
-				Content:    "",
-				StatusCode: curp_proto.ACCEPTED,
-			}
-			return reply
-		}
-	}
-	buf := cmd.Encode()
-	go func() {
-		s.fastPath <- cmd
-	}()
-	if s.raftState == raft.StateLeader {
-		// command will update the state machine or get command is conflict
-		trace.Trace(trace.Leader, s.NodeId, "send propose[clientId:%d seqId: %d] msg to raft node", cmd.ClientId, cmd.SeqId)
-		go func() {
-			s.proposeC <- buf
-		}()
-
-	}
-	s.mu.Unlock()
 	proposeId := command.ProposeId{
 		ClientId: cmd.ClientId,
 		SeqId:    cmd.SeqId,
 	}
-	result := s.commandBoard.WaitForEr(proposeId)
-	reply := &curp_proto.CurpReply{
-		Content: result,
-	}
-	if isConflict {
-		// TODO return and report conflict
-		reply.StatusCode = curp_proto.CONFLICT
-	} else {
-		reply.StatusCode = curp_proto.ACCEPTED
-	}
+	workerId := proposeId.Hash() % uint64(len(s.workers))
+	worker := s.workers[workerId]
+	reply := worker.Propose(cmd)
+
 	return reply
 }
 
@@ -197,13 +164,14 @@ func (s *StateMachine) Propose(cmd *curp_proto.CurpClientCommand) *curp_proto.Cu
 func (s *StateMachine) WaitSynced(id command.ProposeId) *curp_proto.CurpReply {
 	// only send wait synced message to leader
 	trace.Trace(trace.Leader, s.NodeId, "got wait synced message: %v", id)
-	result := s.commandBoard.WaitForAsr(id)
-	reply := &curp_proto.CurpReply{
-		Content:    result,
-		StatusCode: curp_proto.ACCEPTED,
+	proposeId := command.ProposeId{
+		ClientId: id.ClientId,
+		SeqId:    id.SeqId,
 	}
-	trace.Trace(trace.Leader, s.NodeId, "wait synced finished,id: %v,result: %v", id, result)
-	return reply
+	workerId := proposeId.Hash() % uint64(len(s.workers))
+	worker := s.workers[workerId]
+	result := worker.WaitSynced(proposeId)
+	return result
 }
 
 func (s *StateMachine) listenRaftState() {
@@ -212,49 +180,52 @@ func (s *StateMachine) listenRaftState() {
 		s.mu.Lock()
 		trace.Trace(trace.Vote, s.NodeId, "raft state update: before: %s,current: %s", stmap[s.raftState], stmap[state])
 		s.raftState = state
+		for _, worker := range s.workers {
+			worker.raftState = state
+		}
 		s.mu.Unlock()
 	}
 }
 
-func (s *StateMachine) cmd_worker() {
-	for {
-		select {
-		case cmd := <-s.fastPath:
-			trace.Trace(trace.Fast, s.NodeId, "got cmd from fast path %v", cmd)
-			proposeId := command.ProposeId{
-				ClientId: cmd.ClientId,
-				SeqId:    cmd.SeqId,
-			}
-			if _, ok := s.commandSet[proposeId]; ok {
-				// command executed before,nothing to do
-				trace.Trace(trace.Fast, s.NodeId, "cmd already executed %v", cmd)
-			} else {
-				s.commandSet[proposeId] = struct{}{}
-				result := s.executeSync(cmd)
-				trace.Trace(trace.Fast, s.NodeId, "cmd %v executed,result is %v", cmd, result)
-				s.commandBoard.InsertEr(proposeId, result)
-			}
+// func (s *StateMachine) cmd_worker() {
+// 	for {
+// 		select {
+// 		case cmd := <-s.fastPath:
+// 			trace.Trace(trace.Fast, s.NodeId, "got cmd from fast path %v", cmd)
+// 			proposeId := command.ProposeId{
+// 				ClientId: cmd.ClientId,
+// 				SeqId:    cmd.SeqId,
+// 			}
+// 			if _, ok := s.commandSet[proposeId]; ok {
+// 				// command executed before,nothing to do
+// 				trace.Trace(trace.Fast, s.NodeId, "cmd already executed %v", cmd)
+// 			} else {
+// 				s.commandSet[proposeId] = struct{}{}
+// 				result := s.executeSync(cmd)
+// 				trace.Trace(trace.Fast, s.NodeId, "cmd %v executed,result is %v", cmd, result)
+// 				s.commandBoard.InsertEr(proposeId, result)
+// 			}
 
-		case cmd := <-s.slowPath:
-			s.mu.Lock()
-			isLeader := s.raftState == raft.StateLeader
-			s.mu.Unlock()
-			trace.Trace(trace.Slow, s.NodeId, "got cmd from slow path %v", cmd)
-			if _, ok := s.commandSet[cmd.ProposeId()]; ok && isLeader {
-				// command executed before,nothing to do
-				trace.Trace(trace.Slow, s.NodeId, "cmd already executed %v", cmd)
-			} else {
-				s.commandSet[cmd.ProposeId()] = struct{}{}
-				s.executeAsync(cmd)
-			}
-			trace.Trace(trace.Slow, s.NodeId, "WAIT Notify result in slow path,proposeId:[clientId: %d,seqId: %d]", cmd.ClientId, cmd.SeqId)
-			s.commandBoard.NotifyAsr(cmd.ProposeId())
-			trace.Trace(trace.Slow, s.NodeId, "Notify result in slow path,proposeId:[clientId: %d,seqId: %d]", cmd.ClientId, cmd.SeqId)
-			// when command is committed, it can be remove from witness and command set safely
-			s.removeRecord(cmd)
-		}
-	}
-}
+// 		case cmd := <-s.slowPath:
+// 			s.mu.Lock()
+// 			isLeader := s.raftState == raft.StateLeader
+// 			s.mu.Unlock()
+// 			trace.Trace(trace.Slow, s.NodeId, "got cmd from slow path %v", cmd)
+// 			if _, ok := s.commandSet[cmd.ProposeId()]; ok && isLeader {
+// 				// command executed before,nothing to do
+// 				trace.Trace(trace.Slow, s.NodeId, "cmd already executed %v", cmd)
+// 			} else {
+// 				s.commandSet[cmd.ProposeId()] = struct{}{}
+// 				s.executeAsync(cmd)
+// 			}
+// 			trace.Trace(trace.Slow, s.NodeId, "WAIT Notify result in slow path,proposeId:[clientId: %d,seqId: %d]", cmd.ClientId, cmd.SeqId)
+// 			s.commandBoard.NotifyAsr(cmd.ProposeId())
+// 			trace.Trace(trace.Slow, s.NodeId, "Notify result in slow path,proposeId:[clientId: %d,seqId: %d]", cmd.ClientId, cmd.SeqId)
+// 			// when command is committed, it can be remove from witness and command set safely
+// 			s.removeRecord(cmd)
+// 		}
+// 	}
+// }
 
 func (s *StateMachine) readCommits(commitC <-chan *commit, errorC <-chan error) {
 	for commit := range commitC {
@@ -279,7 +250,13 @@ func (s *StateMachine) readCommits(commitC <-chan *commit, errorC <-chan error) 
 			if err := dec.Decode(&cmd); err != nil {
 				log.Fatalf("raftexample: could not decode message (%v)", err)
 			}
-			s.slowPath <- &cmd
+			proposeId := command.ProposeId{
+				ClientId: cmd.ClientId,
+				SeqId:    cmd.SeqId,
+			}
+			workerId := proposeId.Hash() % uint64(len(s.workers))
+			worker := s.workers[workerId]
+			worker.slowPath <- &cmd
 
 		}
 		close(commit.applyDoneC)
@@ -289,56 +266,56 @@ func (s *StateMachine) readCommits(commitC <-chan *commit, errorC <-chan error) 
 	}
 }
 
-// TODO: refactor it later
-// we don't need to lock this function,because it's the only one which modify KVStore
-// same as executeAsync
-func (s *StateMachine) executeSync(cmd *curp_proto.CurpClientCommand) string {
-	if cmd.Op == command.PUT {
-		// s.kvStore[cmd.Key] = cmd.Value
-		s.KVStore.Put(cmd.Key, cmd.Value)
-	} else if cmd.Op == command.DELETE {
-		// delete(s.kvStore, cmd.Key)
-		s.KVStore.Delete(cmd.Key)
-	} else if cmd.Op == command.GET {
-		result, err := s.KVStore.Get(cmd.Key)
-		// result, ok := s.kvStore[cmd.Key]
-		if err != nil {
-			return "NOT FOUND IN STATE"
+// // TODO: refactor it later
+// // we don't need to lock this function,because it's the only one which modify KVStore
+// // same as executeAsync
+// func (s *StateMachine) executeSync(cmd *curp_proto.CurpClientCommand) string {
+// 	if cmd.Op == command.PUT {
+// 		// s.kvStore[cmd.Key] = cmd.Value
+// 		s.KVStore.Put(cmd.Key, cmd.Value)
+// 	} else if cmd.Op == command.DELETE {
+// 		// delete(s.kvStore, cmd.Key)
+// 		s.KVStore.Delete(cmd.Key)
+// 	} else if cmd.Op == command.GET {
+// 		result, err := s.KVStore.Get(cmd.Key)
+// 		// result, ok := s.kvStore[cmd.Key]
+// 		if err != nil {
+// 			return "NOT FOUND IN STATE"
 
-		} else {
-			return result
-		}
-	}
-	return ""
-}
+// 		} else {
+// 			return result
+// 		}
+// 	}
+// 	return ""
+// }
 
-func (s *StateMachine) executeAsync(cmd *curp_proto.CurpClientCommand) string {
-	if cmd.Op == command.PUT {
-		// s.kvStore[cmd.Key] = cmd.Value
-		s.KVStore.Put(cmd.Key, cmd.Value)
-	} else if cmd.Op == command.DELETE {
-		// delete(s.kvStore, cmd.Key)
-		s.KVStore.Delete(cmd.Key)
-	} else if cmd.Op == command.GET {
-		// return s.kvStore[cmd.Key]
-		result, _ := s.KVStore.Get(cmd.Key)
-		return result
-	}
-	return ""
-}
+// func (s *StateMachine) executeAsync(cmd *curp_proto.CurpClientCommand) string {
+// 	if cmd.Op == command.PUT {
+// 		// s.kvStore[cmd.Key] = cmd.Value
+// 		s.KVStore.Put(cmd.Key, cmd.Value)
+// 	} else if cmd.Op == command.DELETE {
+// 		// delete(s.kvStore, cmd.Key)
+// 		s.KVStore.Delete(cmd.Key)
+// 	} else if cmd.Op == command.GET {
+// 		// return s.kvStore[cmd.Key]
+// 		result, _ := s.KVStore.Get(cmd.Key)
+// 		return result
+// 	}
+// 	return ""
+// }
 
-func (s *StateMachine) removeRecord(cmd *curp_proto.CurpClientCommand) {
-	// when the command is executed in slow path it means that it has been replicated to the more than 1/2 followers
-	// so we can remove it from witness safely
-	s.witness.Remove(cmd.ProposeId())
+// func (s *StateMachine) removeRecord(cmd *curp_proto.CurpClientCommand) {
+// 	// when the command is executed in slow path it means that it has been replicated to the more than 1/2 followers
+// 	// so we can remove it from witness safely
+// 	s.witness.Remove(cmd.ProposeId())
 
-	// since we only support idempotent command like set x = 5 (set x = x + 5 or append command is non-idempotent),
-	// we don't need to worry about that some commands will be executed twice
-	// so we can remove it from commandSet safely
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.commandSet, cmd.ProposeId())
-}
+// 	// since we only support idempotent command like set x = 5 (set x = x + 5 or append command is non-idempotent),
+// 	// we don't need to worry about that some commands will be executed twice
+// 	// so we can remove it from commandSet safely
+// 	s.mu.Lock()
+// 	defer s.mu.Unlock()
+// 	delete(s.commandSet, cmd.ProposeId())
+// }
 
 func (s *StateMachine) getSnapshot() ([]byte, error) {
 	s.mu.RLock()

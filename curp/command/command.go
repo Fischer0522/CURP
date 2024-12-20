@@ -2,13 +2,24 @@ package command
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/gob"
+	"hash/fnv"
 	"log"
 )
 
 type ProposeId struct {
 	ClientId uint64
 	SeqId    uint64
+}
+
+func (p *ProposeId) Hash() uint64 {
+	h := fnv.New64a()
+
+	binary.Write(h, binary.BigEndian, p.ClientId)
+	binary.Write(h, binary.BigEndian, p.SeqId)
+
+	return h.Sum64()
 }
 
 type Operation uint32
