@@ -93,7 +93,7 @@ func newGrpcState(rpcAddr string, nodeId int, snapshotter *snap.Snapshotter, pro
 			log.Panic(err)
 		}
 	}
-	s.workers = s.initWorkers(16, &s.KVStore, s.raftState)
+	s.workers = s.initWorkers(64, &s.KVStore, s.raftState)
 
 	go Startgrpc(s, rpcAddr)
 	trace.Trace(trace.Info, nodeId, "init curp state machine")

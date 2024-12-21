@@ -3,26 +3,23 @@ package kv
 import (
 	"encoding/json"
 	"fmt"
-	"sync"
+
+	cmap "github.com/orcaman/concurrent-map/v2"
 )
 
 // thread safe memory kv
 type MemStore struct {
-	kv map[string]string
-	mu *sync.RWMutex
+	kv cmap.ConcurrentMap[string, string]
 }
 
 func NewMemStore() (*MemStore, error) {
 	mkv := &MemStore{}
-	mkv.kv = make(map[string]string)
-	mkv.mu = &sync.RWMutex{}
+	mkv.kv = cmap.New[string]()
 	return mkv, nil
 }
 
 func (m *MemStore) Get(k string) (string, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	v, ok := m.kv[k]
+	v, ok := m.kv.Get(k)
 	if ok {
 		return v, nil
 	} else {
@@ -31,24 +28,18 @@ func (m *MemStore) Get(k string) (string, error) {
 }
 
 func (m *MemStore) Put(k string, v string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.kv[k] = v
+	m.kv.Set(k, v)
 	return nil
 }
 
 func (m *MemStore) Delete(k string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.kv, k)
+	m.kv.Remove(k)
 	return nil
 }
 
 func (m *MemStore) PutWithOldValue(k string, v string) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	old_v, ok := m.kv[k]
-	m.kv[k] = v
+	old_v, ok := m.kv.Get(k)
+	m.kv.Set(k, v)
 	if ok {
 		return old_v, nil
 	} else {
@@ -57,28 +48,26 @@ func (m *MemStore) PutWithOldValue(k string, v string) (string, error) {
 }
 
 func (m *MemStore) RollbackPutWithOldValue(k, old_v string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	if old_v == "" {
-		delete(m.kv, k)
+		m.kv.Remove(k)
 	} else {
-		m.kv[k] = old_v
+		m.kv.Set(k, old_v)
 	}
 	return nil
 }
 
 func (m *MemStore) RollbackDeleteWithOldValue(k, old_v string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.kv[k] = old_v
+	if old_v == "" {
+		m.kv.Remove(k)
+	} else {
+		m.kv.Set(k, old_v)
+	}
 	return nil
 }
 
 func (m *MemStore) DeleteWithOldValue(k string) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	old_v, ok := m.kv[k]
-	delete(m.kv, k)
+	old_v, ok := m.kv.Get(k)
+	m.kv.Remove(k)
 	if ok {
 		return old_v, nil
 	} else {
@@ -86,7 +75,7 @@ func (m *MemStore) DeleteWithOldValue(k string) (string, error) {
 	}
 }
 func (m *MemStore) Destroy() {
-	m.kv = make(map[string]string)
+	m.kv = cmap.New[string]()
 }
 
 // func (m *Mem_kvStore) RLock(k string) (string, KvOpStatus) {
@@ -106,8 +95,8 @@ func (m *MemStore) Printf() {
 }
 
 func (m *MemStore) Equal(kv *MemStore) bool {
-	for key, val1 := range m.kv {
-		if val2, ok := m.kv[key]; !ok {
+	for key, val1 := range m.kv.Items() {
+		if val2, ok := kv.kv.Get(key); !ok {
 			return false
 		} else {
 			if val1 != val2 {
